@@ -43,11 +43,3 @@ the `fit()` defaults: learning rate `1e-3` and weight decay `1e-4`. Seeded initi
 exact results can still vary by device/backend. Pretrained weights are always used
 (and downloaded if needed). Single-video inference timing runs automatically
 and excludes decoding and preprocessing.
-Use `uv run main.py --help` for defaults.
-
-Synthetic checks (create tiny videos in a temporary directory, never read
-project data):
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run python -m unittest discover -s tests -v
-```
