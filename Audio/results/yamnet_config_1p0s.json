@@ -1,0 +1,10 @@
+{
+  "yamnet_handle": "https://tfhub.dev/google/yamnet/1",
+  "yamnet_sample_rate": 16000,
+  "context_seconds": 1.0,
+  "embedding_pool": "mean",
+  "target_animal_recall": 0.95,
+  "random_seed": 42,
+  "zero_shot_threshold": 6.184774639343406e-19,
+  "transfer_threshold": 0.10789871215820312
+}

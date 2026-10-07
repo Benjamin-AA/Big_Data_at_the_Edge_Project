@@ -1,0 +1,14 @@
+{
+  "model": "PANNs Cnn14",
+  "checkpoint": "models\\pretrained\\Cnn14_mAP=0.431.pth",
+  "sample_rate": 32000,
+  "context_seconds": 2.0,
+  "embedding_dim": 2048,
+  "head_hidden_dim": 256,
+  "head_dropout": 0.3,
+  "target_animal_recall": 0.95,
+  "selected_threshold": 0.16617503762245178,
+  "random_seed": 42,
+  "backbone_parameters": 81837071,
+  "head_parameters": 528897
+}

@@ -1,1 +1,19 @@
-data/
+# Jupyter temporary files
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Cached/extracted audio
+Data/audio_cache/
+Data/raw/
+
+# Downloaded pretrained model weights
+Audio/models/pretrained/
+
+# Re-creatable embedding / feature caches
+Audio/results/*features*.npz
+Audio/results/*embeddings*.npz
+
+# Optional Python clutter
+__pycache__/
+*.pyc
+
