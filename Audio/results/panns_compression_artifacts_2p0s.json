@@ -1,0 +1,40 @@
+{
+  "audio_context_seconds": 2.0,
+  "sample_rate_hz": 32000,
+  "run_test_evaluation": false,
+  "pruning": [
+    {
+      "keep_ratio": 0.75,
+      "model_path": "models\\panns_pruned_block4_keep75_2p0s.pt",
+      "trunk_channels": [
+        48,
+        96,
+        192,
+        384
+      ],
+      "validation_threshold": 0.33647778630256653
+    },
+    {
+      "keep_ratio": 0.5,
+      "model_path": "models\\panns_pruned_block4_keep50_2p0s.pt",
+      "trunk_channels": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "validation_threshold": 0.26235970854759216
+    }
+  ],
+  "int8": {
+    "trunk_torchscript_path": "models\\panns_int8_block4_cnn_2p0s.ts",
+    "head_checkpoint_path": "models\\panns_int8_block4_fp32_head_2p0s.pt",
+    "backend": "onednn",
+    "calibration_samples_train_only": 128,
+    "quantized_conv_modules": 8,
+    "validation_threshold": 0.1790429651737213,
+    "scope": "CNN blocks 1\u20134 only. FP32 pretrained frontend and FP32 trained head."
+  },
+  "static_block4_validation_threshold": 0.2001119703054428,
+  "metrics_csv": "results\\panns_compression_comparison_2p0s.csv"
+}
