@@ -1,0 +1,3 @@
+model,median_cpu_ms
+FP32 Block 4 CNN+head,26.381699950434268
+INT8 Block 4 CNN+FP32 head,52.76464996859431

@@ -1,0 +1,13 @@
+model,split,site_id,samples,animals,backgrounds,animal_recall,background_rejection
+FP32 Block 4 (static),validation,S1,56,47,9,0.9148936170212766,0.3333333333333333
+FP32 Block 4 (static),validation,S2,25,25,0,1.0,
+FP32 Block 4 (static),validation,S3,64,43,21,0.9767441860465116,0.9523809523809523
+INT8 CNN Block 4 (static),validation,S1,56,47,9,0.9148936170212766,0.2222222222222222
+INT8 CNN Block 4 (static),validation,S2,25,25,0,1.0,
+INT8 CNN Block 4 (static),validation,S3,64,43,21,0.9767441860465116,0.9523809523809523
+Pruned Block 4 / keep 75%,validation,S1,56,47,9,0.9574468085106383,0.1111111111111111
+Pruned Block 4 / keep 75%,validation,S2,25,25,0,1.0,
+Pruned Block 4 / keep 75%,validation,S3,64,43,21,0.9302325581395349,0.9047619047619048
+Pruned Block 4 / keep 50%,validation,S1,56,47,9,0.9148936170212766,0.0
+Pruned Block 4 / keep 50%,validation,S2,25,25,0,1.0,
+Pruned Block 4 / keep 50%,validation,S3,64,43,21,0.9767441860465116,0.8571428571428571
