@@ -26,6 +26,9 @@ import torch.nn.utils.prune as prune
 import torchvision
 import torchvision.transforms as T
 
+from fvcore.nn import FlopCountAnalysis
+
+
 
 # --------------------------------------------------------------------------
 # Device / data
@@ -234,9 +237,9 @@ def apply_structured_pruning_torch(
     DepGraph-based structured pruning in Section 4, which does remove
     channels and their dependents.
     """
-    for module in model.modules():
-        if isinstance(module, layer_types):
-            prune.ln_structured(module, name="weight", amount=amount, n=2, dim=dim)
+    for name, layer in model.named_modules():
+        if isinstance(layer, nn.Conv2d) and layer.kernel_size == (1, 1) and layer.groups == 1 and ".block.0.0" in name:
+            prune.ln_structured(layer, name="weight", amount=amount, n=1, dim=dim)
     return model
 
 
@@ -253,3 +256,15 @@ def clone_model(model: nn.Module) -> nn.Module:
     """Deep-copy a model — handy for comparing multiple pruning strategies
     starting from the same trained baseline."""
     return copy.deepcopy(model)
+
+
+#TODO: Change to flops measured over a random sample of database clips if implementing early exit
+def count_flops(model, input_size, device):
+    
+    model.eval()
+
+    dummy = torch.randn(*input_size, device=device)
+
+    flops = FlopCountAnalysis(model, dummy).total()
+
+    return flops

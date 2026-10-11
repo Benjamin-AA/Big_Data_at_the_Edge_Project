@@ -2,12 +2,14 @@
 from bisect import bisect_left
 import csv
 from pathlib import Path
-
+import utils
 import av
 import torch
 from torch import nn
 from torch.utils.data import Dataset
 from torchvision.models import MobileNet_V3_Large_Weights, mobilenet_v3_large
+import torch_pruning as tp
+
 
 
 class MammAlpsDataset(Dataset):
@@ -29,9 +31,9 @@ class MammAlpsDataset(Dataset):
             reader = csv.DictReader(f)
             self.metadata = list(reader)
 
-        species = sorted({row["species"] for row in self.metadata})
+        activity = sorted({row["activity"] for row in self.metadata})
         if class_to_idx is None:
-            class_to_idx = {name: i for i, name in enumerate(species)}
+            class_to_idx = {name: i for i, name in enumerate(activity)}
         self.class_to_idx = dict(class_to_idx)
 
 
@@ -41,7 +43,7 @@ class MammAlpsDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata[idx]
         clip = self.sample_clip(self.data_path / row["video_path"], self.num_frames)
-        return clip, torch.tensor(self.class_to_idx[row["species"]], dtype=torch.long)
+        return clip, torch.tensor(self.class_to_idx[row["activity"]], dtype=torch.long)
 
     def sample_clip(self, clip, frames):
         """Sample nearest frames to equally spaced times, including both ends.
@@ -85,11 +87,13 @@ class MammAlpsDataset(Dataset):
 
 
 class Classifier(nn.Module):
-    def __init__(self, device, weights, num_classes):
+    def __init__(self, device, input_size, weights, num_classes):
         super().__init__()
+        self.input_size = input_size
         self.model = mobilenet_v3_large(weights=weights)
         in_features = self.model.classifier[-1].in_features
         self.model.classifier[-1] = nn.Linear(in_features, num_classes)
+        self.device = device
         self.to(device)
 
     def forward(self, clips):
@@ -109,3 +113,15 @@ class Classifier(nn.Module):
             return self(inputs)
         finally:
             self.train(was_training)
+
+    def prune_model(self, type=None):
+        # utils.apply_structured_pruning_torch()
+
+
+        example_inputs = torch.randn(1, 3, 224, 224, device=self.device)
+
+        ignored_layers = [self.model.classifier[-1]]
+
+        importance = tp.importance.MagnitudeImportance(p=2)
+        pruner = tp.pruner.MagnitudePruner(model=self.model, example_inputs=example_inputs, importance=importance, pruning_ratio=0.3, ignored_layers=ignored_layers)
+        pruner.step()

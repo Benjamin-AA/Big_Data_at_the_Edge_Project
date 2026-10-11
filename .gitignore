@@ -5,6 +5,7 @@
 # Cached/extracted audio
 Data/audio_cache/
 Data/raw/
+data/
 
 # Downloaded pretrained model weights
 Audio/models/pretrained/

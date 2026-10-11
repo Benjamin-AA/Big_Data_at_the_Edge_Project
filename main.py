@@ -1,6 +1,7 @@
-"""Train and evaluate a video-level MammAlps baseline."""
+"""Train and evaluate a video-level MammAlps activity baseline."""
 import argparse
 import random
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -8,7 +9,7 @@ from torchvision.models import MobileNet_V3_Large_Weights
 
 from video import MammAlpsDataset, Classifier
 from utils import (get_device, fit, evaluate, count_parameters, model_size_mb,
-                   load_checkpoint, benchmark_latency)
+                   load_checkpoint, benchmark_latency, count_flops, clone_model)
 
 
 def positive_int(value):
@@ -25,11 +26,49 @@ def parse_args():
     parser.add_argument("--epochs", type=positive_int, default=3)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint", default="checkpoints/baseline.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/activity_baseline.pt")
+    parser.add_argument("--load-baseline", action="store_true",
+                        help="Load --checkpoint and skip baseline training before pruning")
     args = parser.parse_args()
     if args.num_workers < 0:
         parser.error("num-workers must be nonnegative")
     return args
+
+
+
+def run_model(device, model, args, loaders, weights, mapping, input_size, save_full_model=False):
+    print(f"Device: {device}; activity classes: {mapping}; frames/video: {args.num_frames}")
+
+    fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs,
+        checkpoint_path=args.checkpoint,
+        checkpoint_metadata={"target": "activity", "class_to_idx": mapping, "config": vars(args),
+                             "sampling": "equidistant_timestamps_nearest_frame",
+                             "preprocessing": str(weights), "aggregation": "mean_logits"})
+    load_checkpoint(model, args.checkpoint, map_location=device)
+    test_loss, test_acc = evaluate(model, loaders["test"], device)
+
+    print(f"Best validation checkpoint: {args.checkpoint}")
+    print(f"Test loss: {test_loss:.4f}; test accuracy: {test_acc:.2f}%")
+    print(f"Parameters: {count_parameters(model):,}; model size: {model_size_mb(model):.2f} MB")
+
+    flops = count_flops(
+        model,
+        input_size=input_size,
+        device=device,
+    )
+    print(f"FLOPs/video: {flops / 1e9:.3f} GFLOPs")
+    latency = benchmark_latency(model, input_size=input_size, device=device)
+    print(f"Inference latency: {latency:.2f} ms/video (excludes decoding/preprocessing)")
+    if save_full_model:
+        checkpoint_path = Path(args.checkpoint)
+        full_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_full{checkpoint_path.suffix}")
+        saved_model = clone_model(model).cpu()
+        saved_model.device = torch.device("cpu")
+        torch.save({"model": saved_model, "class_to_idx": mapping,
+                    "num_frames": args.num_frames, "preprocessing": str(weights),
+                    "aggregation": "mean_logits"}, full_path)
+        print(f"Complete model: {full_path}")
+    return model
 
 
 def main():
@@ -54,23 +93,34 @@ def main():
         for mode, dataset in datasets.items()
     }
     mapping = datasets["train"].class_to_idx
-    model = Classifier(device, weights, len(mapping))
-    print(f"Device: {device}; classes: {mapping}; frames/video: {args.num_frames}")
+    input_size = (1, args.num_frames, 3, 224, 224)
 
-    fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs,
-        checkpoint_path=args.checkpoint,
-        checkpoint_metadata={"class_to_idx": mapping, "config": vars(args),
-                             "sampling": "equidistant_timestamps_nearest_frame",
-                             "preprocessing": str(weights), "aggregation": "mean_logits"})
-    load_checkpoint(model, args.checkpoint, map_location=device)
-    test_loss, test_acc = evaluate(model, loaders["test"], device)
+    model_mobilenet_v3 = Classifier(device, input_size, None if args.load_baseline else weights, len(mapping))
 
-    print(f"Best validation checkpoint: {args.checkpoint}")
-    print(f"Test loss: {test_loss:.4f}; test accuracy: {test_acc:.2f}%")
-    print(f"Parameters: {count_parameters(model):,}; model size: {model_size_mb(model):.2f} MB")
+    if args.load_baseline:
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        if "class_to_idx" in checkpoint and checkpoint["class_to_idx"] != mapping:
+            raise ValueError("Baseline checkpoint activity mapping does not match the dataset")
+        if checkpoint.get("target", "activity") != "activity":
+            raise ValueError("Baseline checkpoint must be an activity model")
+        model_mobilenet_v3.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        baseline_model = model_mobilenet_v3.eval()
+        print(f"Loaded baseline checkpoint: {args.checkpoint}")
+    else:
+        print("Baseline model run \n")
+        baseline_model = run_model(model=model_mobilenet_v3, device=device, args=args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size)
+    
 
-    latency = benchmark_latency(model, input_size=(1, args.num_frames, 3, 224, 224), device=device)
-    print(f"Inference latency: {latency:.2f} ms/video (excludes decoding/preprocessing)")
+    model_structured_depgraph = clone_model(baseline_model)
+    model_structured_depgraph = model_structured_depgraph.to(device)
+    model_structured_depgraph.prune_model()
+    baseline_path = Path(args.checkpoint)
+    pruned_path = baseline_path.with_name(f"{baseline_path.stem}_pruned{baseline_path.suffix}")
+    pruned_args = argparse.Namespace(**vars(args))
+    pruned_args.checkpoint = str(pruned_path)
+    print("Pruned model run \n")
+    pruned_model = run_model(model=model_structured_depgraph, device=device, args=pruned_args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size, save_full_model=True)
+
 
 
 if __name__ == "__main__":
