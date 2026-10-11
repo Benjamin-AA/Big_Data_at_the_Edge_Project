@@ -10,6 +10,8 @@ from torch.utils.data import Dataset
 from torchvision.models import MobileNet_V3_Large_Weights, mobilenet_v3_large
 import torch_pruning as tp
 
+from torch.ao.quantization import get_default_qconfig_mapping
+from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 
 
 class MammAlpsDataset(Dataset):
@@ -95,6 +97,7 @@ class Classifier(nn.Module):
         self.model.classifier[-1] = nn.Linear(in_features, num_classes)
         self.device = device
         self.to(device)
+        self.weights = weights
 
     def forward(self, clips):
         if clips.ndim == 4:
@@ -125,3 +128,24 @@ class Classifier(nn.Module):
         importance = tp.importance.MagnitudeImportance(p=2)
         pruner = tp.pruner.MagnitudePruner(model=self.model, example_inputs=example_inputs, importance=importance, pruning_ratio=0.3, ignored_layers=ignored_layers)
         pruner.step()
+
+    def quantize_weights(self, cpu_device, calibrate_loader, n_batches=20, seed=42):
+        """Apply static PTQ in place, retaining the video aggregation wrapper."""
+        cpu_device = torch.device(cpu_device)
+        if cpu_device.type != "cpu":
+            raise ValueError("Static quantization requires a CPU device")
+        backend = next((name for name in ("x86", "fbgemm", "qnnpack")
+                        if name in torch.backends.quantized.supported_engines), None)
+        if backend is None:
+            raise RuntimeError("No supported static quantization backend available")
+        torch.backends.quantized.engine = backend
+        self.to(cpu_device).eval()
+        self.device = cpu_device
+        example_inputs = (torch.randn(1, *self.input_size[-3:]),)
+        self.model = prepare_fx(
+            self.model, get_default_qconfig_mapping(backend), example_inputs,
+        )
+        # The wrapper flattens video batches into frames before the backbone.
+        utils.calibrate(self, calibrate_loader, cpu_device, n_batches=n_batches, seed=seed)
+        self.model = convert_fx(self.model)
+        return self

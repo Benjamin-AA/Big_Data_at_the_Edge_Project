@@ -122,6 +122,28 @@ def main():
     pruned_model = run_model(model=model_structured_depgraph, device=device, args=pruned_args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size, save_full_model=True)
 
 
+    # Compare all variants on the same CPU and full-video input shape.
+    cpu_device = torch.device("cpu")
+    print("CPU comparison (latency excludes decoding/preprocessing)")
+    for name, source in (("Baseline", baseline_model), ("Pruned", pruned_model)):
+        cpu_model = clone_model(source).cpu().eval()
+        cpu_model.device = cpu_device
+        _, fp32_acc = evaluate(cpu_model, loaders["test"], cpu_device)
+        fp32_size = model_size_mb(cpu_model)
+        fp32_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
+        print(f"{name} FP32: accuracy={fp32_acc:.2f}%, size={fp32_size:.2f} MB, "
+              f"latency={fp32_latency:.2f} ms/video")
+
+        cpu_model.quantize_weights(cpu_device, loaders["train"], n_batches=20, seed=args.seed)
+        _, int8_acc = evaluate(cpu_model, loaders["test"], cpu_device)
+        int8_size = model_size_mb(cpu_model)
+        int8_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
+        print(f"{name} INT8: accuracy={int8_acc:.2f}%, size={int8_size:.2f} MB, "
+              f"latency={int8_latency:.2f} ms/video; "
+              f"accuracy change={int8_acc - fp32_acc:+.2f} percentage points, "
+              f"speedup={fp32_latency / int8_latency:.2f}x")
+
+
 
 if __name__ == "__main__":
     main()

@@ -258,6 +258,26 @@ def clone_model(model: nn.Module) -> nn.Module:
     return copy.deepcopy(model)
 
 
+@torch.no_grad()
+def calibrate(model: nn.Module, loader, device, n_batches: int = 20, seed: int = 42) -> None:
+    """Calibrate on up to n_batches of randomly selected dataset samples.
+
+    Samples are drawn without replacement, independently of loader ordering.
+    A fixed seed gives different model variants the same calibration subset.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    count = min(len(loader.dataset), n_batches * loader.batch_size)
+    indices = torch.randperm(len(loader.dataset), generator=generator)[:count].tolist()
+    calibration_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(loader.dataset, indices),
+        batch_size=loader.batch_size, collate_fn=loader.collate_fn,
+        num_workers=loader.num_workers, generator=generator,
+    )
+    model.eval()
+    for images, _ in calibration_loader:
+        model(images.to(device))
+
+
 #TODO: Change to flops measured over a random sample of database clips if implementing early exit
 def count_flops(model, input_size, device):
     
@@ -268,3 +288,4 @@ def count_flops(model, input_size, device):
     flops = FlopCountAnalysis(model, dummy).total()
 
     return flops
+
