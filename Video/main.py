@@ -128,14 +128,14 @@ def main():
     for name, source in (("Baseline", baseline_model), ("Pruned", pruned_model)):
         cpu_model = clone_model(source).cpu().eval()
         cpu_model.device = cpu_device
-        _, fp32_acc = evaluate(cpu_model, loaders["test"], cpu_device)
+        _, fp32_acc = evaluate(cpu_model, loaders["val"], cpu_device)
         fp32_size = model_size_mb(cpu_model)
         fp32_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
         print(f"{name} FP32: accuracy={fp32_acc:.2f}%, size={fp32_size:.2f} MB, "
               f"latency={fp32_latency:.2f} ms/video")
 
         cpu_model.quantize_weights(cpu_device, loaders["train"], n_batches=20, seed=args.seed)
-        _, int8_acc = evaluate(cpu_model, loaders["test"], cpu_device)
+        _, int8_acc = evaluate(cpu_model, loaders["val"], cpu_device)
         int8_size = model_size_mb(cpu_model)
         int8_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
         print(f"{name} INT8: accuracy={int8_acc:.2f}%, size={int8_size:.2f} MB, "

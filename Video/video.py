@@ -14,9 +14,19 @@ from torch.ao.quantization import get_default_qconfig_mapping
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 
 
+def nested_frame_positions(frames):
+    """Prefixes: midpoint, start, end, quarter, three-quarter, then finer gaps."""
+    positions = [0.5, 0.0, 1.0]
+    denominator = 4
+    while len(positions) < frames:
+        positions.extend(i / denominator for i in range(1, denominator, 2))
+        denominator *= 2
+    return positions[:frames]
+
+
 class MammAlpsDataset(Dataset):
     def __init__(self, data_path_str, metadata_path_str, mode, num_frames=4,
-                 class_to_idx=None, transform=None):
+                 class_to_idx=None, transform=None, sampling="uniform"):
         if mode not in {"train", "val", "test"}:
             raise ValueError(f"Unknown mode: {mode}")
         if not isinstance(num_frames, int) or num_frames < 1:
@@ -24,6 +34,9 @@ class MammAlpsDataset(Dataset):
 
         self.data_path = Path(data_path_str)
         self.mode = mode
+        if sampling not in {"uniform", "nested"}:
+            raise ValueError("sampling must be uniform or nested")
+        self.sampling = sampling
         self.num_frames = num_frames
         self.transform = transform or MobileNet_V3_Large_Weights.DEFAULT.transforms()
         self._sample_indices = {}
@@ -56,15 +69,17 @@ class MammAlpsDataset(Dataset):
         """
         if not isinstance(frames, int) or frames < 1:
             raise ValueError("frames must be a positive integer")
-        key = (str(clip), frames)
+        key = (str(clip), frames, self.sampling)
         try:
             if key not in self._sample_indices:
                 with av.open(str(clip)) as container:
                     times = [frame.time for frame in container.decode(video=0)]
 
-                targets = ([(times[0] + times[-1]) / 2] if frames == 1 else
-                           [times[0] + (times[-1] - times[0]) * i / (frames - 1)
-                            for i in range(frames)])
+                if self.sampling == "nested":
+                    positions = nested_frame_positions(frames)
+                else:
+                    positions = [0.5] if frames == 1 else [i / (frames - 1) for i in range(frames)]
+                targets = [times[0] + (times[-1] - times[0]) * position for position in positions]
                 indices = []
                 for target in targets:
                     right = min(bisect_left(times, target), len(times) - 1)
@@ -98,15 +113,72 @@ class Classifier(nn.Module):
         self.device = device
         self.to(device)
         self.weights = weights
+        self.num_classes = num_classes
+        self.battery_level = 100
 
-    def forward(self, clips):
+    def forward(self, clips, adaptive_threshold=None, return_frames_used=False):
+        if adaptive_threshold is not None and not 0 <= adaptive_threshold <= 1:
+            raise ValueError("adaptive_threshold must be between 0 and 1")
         if clips.ndim == 4:
-            return self.model(clips)
+            logits = self.model(clips)
+            counts = torch.ones(clips.shape[0], dtype=torch.long, device=clips.device)
+            return (logits, counts) if return_frames_used else logits
         if clips.ndim != 5 or clips.shape[1] < 1:
-            raise ValueError("Expected [B,T,C,H,W] clips or [B,C,H,W] images")
-        batch, frames, channels, height, width = clips.shape
-        logits = self.model(clips.reshape(batch * frames, channels, height, width))
-        return logits.reshape(batch, frames, -1).mean(dim=1)
+            raise ValueError("Expected nonempty [B,T,C,H,W] videos or [B,C,H,W] images")
+
+        batch, max_frames, channels, height, width = clips.shape
+
+        if adaptive_threshold is not None:
+            active_idx = torch.arange(batch, device=clips.device)
+            logits_sum = torch.zeros(batch, self.num_classes, device=clips.device)
+            frames_used = torch.zeros(batch, dtype=torch.long, device=clips.device)
+
+            previous_frames = 0
+            target_frames = 1
+
+            while target_frames <= max_frames and len(active_idx) > 0:
+                new_frames = clips[active_idx, previous_frames:target_frames]
+                n_active = len(active_idx)
+                n_new = target_frames - previous_frames
+
+                new_frames = new_frames.reshape(
+                    n_active * n_new, channels, height, width
+                )
+
+                new_logits = self.model(new_frames).reshape(
+                    n_active, n_new, self.num_classes
+                )
+
+                logits_sum[active_idx] += new_logits.sum(dim=1)
+                frames_used[active_idx] += n_new
+
+                mean_logits = (
+                    logits_sum[active_idx]
+                    / frames_used[active_idx].unsqueeze(1)
+                )
+
+                confidence = torch.softmax(
+                    mean_logits, dim=1
+                ).max(dim=1).values
+
+                active_idx = active_idx[confidence < adaptive_threshold]
+
+                if target_frames == max_frames:
+                    break
+                previous_frames = target_frames
+                # Evaluate midpoint, then both endpoints, then double the budget.
+                target_frames = min(max_frames, 3 if target_frames == 1 else target_frames * 2)
+
+            logits = logits_sum / frames_used.unsqueeze(1)
+            return (logits, frames_used) if return_frames_used else logits
+
+        logits = self.model(
+            clips.reshape(batch * max_frames, channels, height, width)
+        )
+
+        logits = logits.reshape(batch, max_frames, -1).mean(dim=1)
+        counts = torch.full((batch,), max_frames, dtype=torch.long, device=clips.device)
+        return (logits, counts) if return_frames_used else logits
 
     @torch.no_grad()
     def evaluate_model(self, inputs):
@@ -128,6 +200,8 @@ class Classifier(nn.Module):
         importance = tp.importance.MagnitudeImportance(p=2)
         pruner = tp.pruner.MagnitudePruner(model=self.model, example_inputs=example_inputs, importance=importance, pruning_ratio=0.3, ignored_layers=ignored_layers)
         pruner.step()
+
+
 
     def quantize_weights(self, cpu_device, calibrate_loader, n_batches=20, seed=42):
         """Apply static PTQ in place, retaining the video aggregation wrapper."""

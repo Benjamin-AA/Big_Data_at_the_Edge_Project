@@ -130,31 +130,88 @@ def evaluate(model, loader, device) -> tuple[float, float]:
     return total_loss / total, 100.0 * correct / total
 
 
+
+@torch.inference_mode()
+def evaluate_metrics(model, loader, device, class_to_idx):
+    """Compute whole-split metrics; return aggregate and per-class dictionaries.
+
+    Scores are fractions in [0, 1]. mAP averages classes present in the split.
+    """
+    import numpy as np
+    from sklearn.metrics import accuracy_score, average_precision_score
+
+    class_ids = list(range(len(class_to_idx)))
+    if not class_ids or sorted(class_to_idx.values()) != class_ids:
+        raise ValueError("class_to_idx must contain contiguous indices starting at zero")
+    model.eval()
+    labels, probabilities = [], []
+    total_loss = 0.0
+    for clips, targets in loader:
+        logits = model(clips.to(device))
+        if logits.ndim != 2 or logits.shape != (targets.numel(), len(class_ids)):
+            raise ValueError("Model output dimensions do not match labels/class mapping")
+        if not torch.isfinite(logits).all():
+            raise ValueError("Model produced nonfinite logits")
+        total_loss += float(nn.functional.cross_entropy(logits.float(), targets.to(device), reduction="sum"))
+        labels.append(targets.cpu().numpy())
+        probabilities.append(logits.float().softmax(dim=1).cpu().numpy())
+    if not labels:
+        raise ValueError("Cannot evaluate an empty dataset")
+    labels = np.concatenate(labels)
+    probabilities = np.concatenate(probabilities)
+    if not np.isin(labels, class_ids).all():
+        raise ValueError("Labels contain indices absent from the checkpoint mapping")
+    predictions = probabilities.argmax(axis=1)
+    support = np.bincount(labels, minlength=len(class_ids))
+    names = {index: name for name, index in class_to_idx.items()}
+    ap = [float(average_precision_score(labels == index, probabilities[:, index]))
+          if support[index] else None for index in class_ids]
+    per_class = [dict(class_id=index, activity=names[index], support=int(support[index]),
+                      average_precision=ap[index]) for index in class_ids]
+    aggregate = dict(loss=total_loss / len(labels), num_videos=int(len(labels)), accuracy=float(accuracy_score(labels, predictions)),
+                     map=float(np.mean([value for value in ap if value is not None])),
+                     absent_classes=[names[index] for index in class_ids if not support[index]],
+                     map_scope="present_classes")
+    return aggregate, per_class
+
+
 def fit(
     model, train_loader, val_loader, device,
     epochs: int = 3, lr: float = 1e-3, weight_decay: float = 1e-4,
     verbose: bool = True, checkpoint_path=None, checkpoint_metadata=None,
 ) -> nn.Module:
     """Minimal training loop, used both for the initial baseline and for
-    post-pruning fine-tuning."""
+    post-pruning fine-tuning. Select highest validation accuracy, then lowest loss,
+    including the starting model as an epoch-0 checkpoint candidate."""
     if epochs < 1:
         raise ValueError("epochs must be positive")
-    best_loss = float("inf")
     model.to(device)
+    best_loss, best_acc = evaluate(model, val_loader, device)
+    if not (math.isfinite(best_loss) and math.isfinite(best_acc)):
+        raise RuntimeError("Initial validation metrics are non-finite; refusing to select a checkpoint")
+    if checkpoint_path is not None:
+        save_checkpoint(model, checkpoint_path, {
+            **(checkpoint_metadata or {}), "epoch": 0,
+            "val_loss": best_loss, "val_accuracy": best_acc,
+            "selection_metric": "val_accuracy", "selection_tiebreaker": "val_loss",
+        })
+    if verbose:
+        print(f"epoch 0/{epochs} - val_loss: {best_loss:.4f} - val_acc: {best_acc:.2f}% (starting model)")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_acc = evaluate(model, val_loader, device)
-        if not math.isfinite(val_loss):
-            raise RuntimeError("Validation loss is non-finite; refusing to select a checkpoint")
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if not (math.isfinite(val_loss) and math.isfinite(val_acc)):
+            raise RuntimeError("Validation metrics are non-finite; refusing to select a checkpoint")
+        if val_acc > best_acc or (val_acc == best_acc and val_loss < best_loss):
+            best_loss, best_acc = val_loss, val_acc
             if checkpoint_path is not None:
                 save_checkpoint(model, checkpoint_path, {
                     **(checkpoint_metadata or {}), "epoch": epoch,
                     "val_loss": val_loss, "val_accuracy": val_acc,
+                    "selection_metric": "val_accuracy", "selection_tiebreaker": "val_loss",
                 })
         if verbose:
             print(
