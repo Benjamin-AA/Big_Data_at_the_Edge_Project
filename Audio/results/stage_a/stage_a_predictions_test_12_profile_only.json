@@ -1,0 +1,28 @@
+{
+  "objective": "Stage A conditional model-execution measurement; activity accuracy not evaluated",
+  "split": "test",
+  "num_selected": 12,
+  "num_completed": 12,
+  "audio_policy": "balanced",
+  "audio_margin1": 2.0,
+  "audio_margin2": 0.25,
+  "audio_thresholds": {
+    "exit1": 0.2324143648147583,
+    "exit2": 0.2000872790813446,
+    "final": 0.1661750376224517
+  },
+  "video_architecture": "MobileNetV3 Large, frame-logit average",
+  "video_inference_mode": "profile_only",
+  "video_checkpoint": null,
+  "activity_predictions_valid": false,
+  "video_adaptive_threshold": null,
+  "video_num_frames": 4,
+  "frame_sampling": "interior evenly spaced within 2-second window",
+  "flops": "THOP MACs*2, sum actual audio exit and video frames executed; excludes decoding/preprocessing",
+  "audio_source": "data\\metadata\\benchmark_2_audio_model_manifest.csv",
+  "torch": "2.14.1+cu130",
+  "device": "cuda",
+  "download_missing_mp4": true,
+  "video_training_overlap_checked": true,
+  "prediction_csv": "Audio\\results\\stage_a\\stage_a_predictions_test_12_profile_only.csv"
+}
