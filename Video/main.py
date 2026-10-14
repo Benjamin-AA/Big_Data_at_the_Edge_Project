@@ -1,5 +1,6 @@
-"""Train and evaluate a video-level MammAlps activity baseline."""
+"""Train and evaluate a video-level MammAlps activity or species baseline."""
 import argparse
+from copy import copy
 import random
 from pathlib import Path
 
@@ -9,7 +10,8 @@ from torchvision.models import MobileNet_V3_Large_Weights
 
 from video import MammAlpsDataset, Classifier
 from utils import (get_device, fit, evaluate, count_parameters, model_size_mb,
-                   load_checkpoint, benchmark_latency, count_flops, clone_model)
+                   load_checkpoint, benchmark_latency, count_flops, clone_model,
+                   training_clip_transform, training_sampler)
 
 
 def positive_int(value):
@@ -26,10 +28,17 @@ def parse_args():
     parser.add_argument("--epochs", type=positive_int, default=3)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint", default="checkpoints/activity_baseline.pt")
+    parser.add_argument("--target", choices=["activity", "species"], default="activity")
+    parser.add_argument("--checkpoint", help="Default: checkpoints/<target>_baseline.pt")
     parser.add_argument("--load-baseline", action="store_true",
                         help="Load --checkpoint and skip baseline training before pruning")
+    parser.add_argument("--augment", action="store_true",
+                        help="Apply mild, temporally consistent training clip augmentation")
+    parser.add_argument("--oversample", action="store_true",
+                        help="Boost rare training classes with inverse-square-root frequency sampling")
     args = parser.parse_args()
+    if args.checkpoint is None:
+        args.checkpoint = f"checkpoints/{args.target}_baseline.pt"
     if args.num_workers < 0:
         parser.error("num-workers must be nonnegative")
     return args
@@ -37,11 +46,11 @@ def parse_args():
 
 
 def run_model(device, model, args, loaders, weights, mapping, input_size, save_full_model=False):
-    print(f"Device: {device}; activity classes: {mapping}; frames/video: {args.num_frames}")
+    print(f"Device: {device}; {args.target} classes: {mapping}; frames/video: {args.num_frames}")
 
     fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs,
         checkpoint_path=args.checkpoint,
-        checkpoint_metadata={"target": "activity", "class_to_idx": mapping, "config": vars(args),
+        checkpoint_metadata={"target": args.target, "class_to_idx": mapping, "config": vars(args),
                              "sampling": "equidistant_timestamps_nearest_frame",
                              "preprocessing": str(weights), "aggregation": "mean_logits"})
     load_checkpoint(model, args.checkpoint, map_location=device)
@@ -64,7 +73,7 @@ def run_model(device, model, args, loaders, weights, mapping, input_size, save_f
         full_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_full{checkpoint_path.suffix}")
         saved_model = clone_model(model).cpu()
         saved_model.device = torch.device("cpu")
-        torch.save({"model": saved_model, "class_to_idx": mapping,
+        torch.save({"model": saved_model, "target": args.target, "class_to_idx": mapping,
                     "num_frames": args.num_frames, "preprocessing": str(weights),
                     "aggregation": "mean_logits"}, full_path)
         print(f"Complete model: {full_path}")
@@ -83,15 +92,24 @@ def main():
             "data/mammalps_v1/benchmark_1/clips/",
             "data/mammalps_v1/benchmark_1/metadata/", mode, num_frames=args.num_frames,
             class_to_idx=None if mode == "train" else datasets["train"].class_to_idx,
-            transform=weights.transforms(),
+            transform=weights.transforms(), target=args.target,
+            clip_transform=training_clip_transform() if mode == "train" and args.augment else None,
         )
+    sampler = training_sampler(datasets["train"], args.seed) if args.oversample else None
     loaders = {
-        mode: DataLoader(dataset, batch_size=args.batch_size, shuffle=mode == "train",
+        mode: DataLoader(dataset, batch_size=args.batch_size,
+                         shuffle=mode == "train" and sampler is None,
+                         sampler=sampler if mode == "train" else None,
                          num_workers=args.num_workers, pin_memory=device.type == "cuda",
                          persistent_workers=args.num_workers > 0,
                          generator=torch.Generator().manual_seed(args.seed))
         for mode, dataset in datasets.items()
     }
+    # Calibration uses the natural training distribution without random augmentation.
+    calibration_dataset = copy(datasets["train"])
+    calibration_dataset.clip_transform = None
+    calibration_loader = DataLoader(calibration_dataset, batch_size=args.batch_size,
+                                    num_workers=args.num_workers)
     mapping = datasets["train"].class_to_idx
     input_size = (1, args.num_frames, 3, 224, 224)
 
@@ -100,9 +118,9 @@ def main():
     if args.load_baseline:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
         if "class_to_idx" in checkpoint and checkpoint["class_to_idx"] != mapping:
-            raise ValueError("Baseline checkpoint activity mapping does not match the dataset")
-        if checkpoint.get("target", "activity") != "activity":
-            raise ValueError("Baseline checkpoint must be an activity model")
+            raise ValueError("Baseline checkpoint class mapping does not match the dataset")
+        if checkpoint.get("target", args.target) != args.target:
+            raise ValueError("Baseline checkpoint target does not match --target")
         model_mobilenet_v3.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         baseline_model = model_mobilenet_v3.eval()
         print(f"Loaded baseline checkpoint: {args.checkpoint}")
@@ -134,7 +152,7 @@ def main():
         print(f"{name} FP32: accuracy={fp32_acc:.2f}%, size={fp32_size:.2f} MB, "
               f"latency={fp32_latency:.2f} ms/video")
 
-        cpu_model.quantize_weights(cpu_device, loaders["train"], n_batches=20, seed=args.seed)
+        cpu_model.quantize_weights(cpu_device, calibration_loader, n_batches=20, seed=args.seed)
         _, int8_acc = evaluate(cpu_model, loaders["val"], cpu_device)
         int8_size = model_size_mb(cpu_model)
         int8_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)

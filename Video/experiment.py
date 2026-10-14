@@ -43,8 +43,12 @@ class Experiment:
         self.mapping = checkpoint.get('class_to_idx')
         if not self.mapping or sorted(self.mapping.values()) != list(range(len(self.mapping))):
             raise ValueError('Checkpoint needs a contiguous class_to_idx mapping')
-        if checkpoint.get('target', 'activity') != 'activity':
-            raise ValueError('Expected an activity checkpoint')
+        requested_target = getattr(args, 'target', None)
+        self.target = checkpoint.get('target') or requested_target or 'activity'
+        if self.target not in {'activity', 'species'}:
+            raise ValueError('Checkpoint target must be activity or species')
+        if requested_target is not None and requested_target != self.target:
+            raise ValueError('Checkpoint target does not match --target')
         if checkpoint.get('aggregation', 'mean_logits') != 'mean_logits':
             raise ValueError('Expected mean_logits aggregation')
         if checkpoint.get('preprocessing', str(self.weights)) != str(self.weights):
@@ -83,12 +87,12 @@ class Experiment:
         key = (split, frames)
         if key not in self._datasets:
             dataset = MammAlpsDataset(str(self.args.clips_dir), str(self.args.metadata_dir), split,
-                                     num_frames=frames, class_to_idx=self.mapping,
+                                     num_frames=frames, class_to_idx=self.mapping, target=self.target,
                                      transform=self.weights.transforms(),
                                      sampling="nested" if self.args.command == "adaptive" else "uniform")
-            unseen = {row['activity'] for row in dataset.metadata} - set(self.mapping)
+            unseen = {row[self.target] for row in dataset.metadata} - set(self.mapping)
             if not len(dataset) or unseen:
-                raise ValueError(f'Invalid {split} dataset: empty or unseen activities {unseen}')
+                raise ValueError(f'Invalid {split} dataset: empty or unseen {self.target} labels {unseen}')
             self._datasets[key] = dataset
         return self._datasets[key]
 
@@ -216,7 +220,7 @@ class Experiment:
             random.seed(args.seed); torch.manual_seed(args.seed)
             data = loaders()
             path = args.output_dir / f'{label}.pt'
-            metadata = dict(target='activity', class_to_idx=mapping, num_frames=4,
+            metadata = dict(target=self.target, class_to_idx=mapping, num_frames=4,
                             pruning_ratio=amount, preprocessing=str(weights), aggregation='mean_logits')
             print(f"Fine-tuning {amount:.0%} channel removal for {args.epochs} epochs", flush=True)
             fit(model, data['train'], data['val'], device, epochs=args.epochs, lr=args.lr,
@@ -229,6 +233,99 @@ class Experiment:
             del model, data
         plot_comparison(csv_path, args.output_dir, "pruning")
         print(f"Saved checkpoints, CSV, metadata and plots to {args.output_dir}")
+
+    def run_quantization(self):
+        """CPU FP32 versus static INT8 PTQ for saved baseline and pruned models."""
+        import torch
+        from utils import evaluate_metrics, model_size_mb, benchmark_latency
+
+        args = self.args
+        pruned_args = argparse.Namespace(**vars(args))
+        pruned_args.checkpoint = args.pruned_checkpoint
+        pruned_args.full_model = True
+        pruned_args.target = self.target
+        pruned = Experiment(pruned_args)
+        if pruned.mapping != self.mapping:
+            raise ValueError('Baseline and pruned checkpoint class mappings must match')
+        frames = args.num_frames or (self.trained_frames if self.trained_frames != 'unknown' else 4)
+        if self.trained_frames != pruned.trained_frames:
+            print(f'Checkpoint training frame counts differ: {self.trained_frames} and '
+                  f'{pruned.trained_frames}; evaluating both with {frames} frames')
+        evaluation_loader = self.loader(args.split, frames)
+        calibration_loader = self.loader('train', frames)
+        output = args.output_dir or Path('results/quantization') / f'{self.checkpoint_path.stem}_{args.split}_{frames}frames_cpu'
+        output.mkdir(parents=True, exist_ok=True)
+        rows = []
+        print(f'CPU PTQ comparison: {args.split}, {frames} frames/video; '
+              f'calibration uses up to {args.calibration_batches} training batches', flush=True)
+        for label, experiment in (('baseline', self), ('pruned', pruned)):
+            model = experiment.fresh_model()
+            reference = None
+            for precision in ('FP32', 'INT8'):
+                if precision == 'INT8':
+                    model.quantize_weights(self.device, calibration_loader,
+                                           n_batches=args.calibration_batches, seed=args.seed)
+                if precision == 'INT8':
+                    # Export the frame backbone; adaptive video control stays in Classifier.
+                    artifact = output / f'{label}_int8.pt'
+                    with torch.inference_mode():
+                        backbone = torch.jit.trace(model.model, torch.zeros(1, 3, 224, 224))
+                        # Frames are flattened into variable-size batches at runtime.
+                        probe = torch.randn(3, 3, 224, 224)
+                        torch.testing.assert_close(backbone(probe), model.model(probe))
+                    torch.jit.save(backbone, str(artifact))
+                    artifact.with_suffix('.json').write_text(json.dumps(dict(
+                        format='torchscript_int8_frame_backbone', target=self.target,
+                        class_to_idx=self.mapping, num_frames=frames,
+                        preprocessing=str(self.weights), aggregation='mean_logits',
+                        quantization_backend=torch.backends.quantized.engine,
+                        architecture='mobilenet_v3_large', pruned=label == 'pruned',
+                        source_checkpoint=str(experiment.checkpoint_path.resolve()),
+                        calibration_seed=args.seed, calibration_batches=args.calibration_batches,
+                    ), indent=2))
+                    print(f'Saved final INT8 backbone: {artifact}', flush=True)
+                metrics, per_class = evaluate_metrics(model, evaluation_loader, self.device, self.mapping)
+                with torch.inference_mode():
+                    latency = benchmark_latency(model, input_size=self.input_shape(frames),
+                                                device=self.device, n_runs=args.latency_runs)
+                row = dict(model=label, precision=precision, checkpoint=str(experiment.checkpoint_path),
+                           target=self.target, split=args.split, num_frames=frames,
+                           num_videos=metrics['num_videos'], accuracy_pct=100 * metrics['accuracy'],
+                           map_pct=100 * metrics['map'], map_scope=metrics['map_scope'],
+                           absent_classes=json.dumps(metrics['absent_classes']), loss=metrics['loss'],
+                           size_mb=model_size_mb(model), latency_ms=latency, benchmark_device='cpu')
+                if reference is None:
+                    reference = row.copy()
+                row.update(accuracy_change_pp=row['accuracy_pct'] - reference['accuracy_pct'],
+                           map_change_pp=row['map_pct'] - reference['map_pct'],
+                           speedup=reference['latency_ms'] / latency)
+                rows.append(row)
+                with (output / f'{label}_{precision.lower()}_per_class.csv').open('w', newline='') as file:
+                    writer = csv.DictWriter(file, fieldnames=list(per_class[0]))
+                    writer.writeheader(); writer.writerows(per_class)
+                # Save completed variants as we go, in case a later conversion fails.
+                with (output / 'metrics.csv').open('w', newline='') as file:
+                    writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+                    writer.writeheader(); writer.writerows(rows)
+                print(f"{label} {precision}: accuracy={row['accuracy_pct']:.2f}%, "
+                      f"mAP={row['map_pct']:.2f}%, size={row['size_mb']:.2f} MB, "
+                      f"latency={latency:.2f} ms/video; "
+                      f"accuracy change={row['accuracy_change_pp']:+.2f} pp, "
+                      f"speedup={row['speedup']:.2f}x", flush=True)
+            del model
+        metadata = dict(
+            arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+            target=self.target, class_to_idx=self.mapping, torch_version=str(torch.__version__),
+            quantization_backend=torch.backends.quantized.engine, cpu_threads=torch.get_num_threads(),
+            calibration_split='train', calibration_seed=args.seed,
+            calibration_num_videos=min(len(calibration_loader.dataset), args.calibration_batches * args.batch_size),
+            calibration_preprocessing='Deterministic, no augmentation or oversampling',
+            size_definition='Serialized state_dict in MiB, including buffers and quantized packed weights',
+            latency_definition='Mean CPU inference time, batch size 1 video; excludes decoding/preprocessing',
+        )
+        (output / 'metadata.json').write_text(json.dumps(metadata, indent=2))
+        print(f'Saved comparison and per-class results to {output}')
+        return rows
 
     def run_adaptive(self):
         from adaptive_video import adaptive_evaluate
@@ -249,7 +346,7 @@ class Experiment:
         print(f'Evaluating {args.checkpoint} on {args.split}: {len(loader.dataset)} videos, {frames} frames, {device}', flush=True)
         aggregate, per_class = evaluate_metrics(model, loader, device, mapping)
         aggregate.update(checkpoint=str(args.checkpoint.resolve()), split=args.split,
-                         device=args.device, num_frames=frames, class_to_idx=mapping)
+                         device=args.device, num_frames=frames, class_to_idx=mapping, target=self.target)
         output = args.output_dir or Path('results/evaluation') / f'{args.checkpoint.stem}_{args.split}_{frames}frames_{args.device}'
         output.mkdir(parents=True, exist_ok=True)
         (output / 'metrics.json').write_text(json.dumps(aggregate, indent=2, allow_nan=False))
@@ -259,6 +356,15 @@ class Experiment:
         for label, key in [('Accuracy', 'accuracy'), ('mAP', 'map')]:
             print(f'{label}: {100 * aggregate[key]:.2f}%')
         print('mAP averages classes present in this split.')
+        width = max(len(self.target), *(len(row[self.target]) for row in per_class))
+        print('\nPrediction counts (highest-probability class):')
+        print(f"{self.target.capitalize():<{width}}  {'Actual':>8}  {'Predicted':>10}  {'Correct':>8}")
+        for row in per_class:
+            print(f"{row[self.target]:<{width}}  {row['support']:>8}  "
+                  f"{row['predicted_count']:>10}  {row['correct_count']:>8}")
+        print(f"{'Total':<{width}}  {sum(row['support'] for row in per_class):>8}  "
+              f"{sum(row['predicted_count'] for row in per_class):>10}  "
+              f"{sum(row['correct_count'] for row in per_class):>8}")
         if aggregate['absent_classes']:
             print('Classes without positive examples:', ', '.join(aggregate['absent_classes']))
         print(f'Saved fractional scores (0–1) to {output}; rerunning overwrites these result files.')
@@ -317,6 +423,82 @@ def plot_comparison(csv_path, output_dir, kind):
     plt.close(fig)
 
 
+def plot_distribution(args):
+    """Compare train metadata with one reproducible epoch of the actual sampler."""
+    from collections import Counter
+    from types import SimpleNamespace
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from utils import training_sampler
+
+    metadata_path = args.metadata_dir / 'train.csv'
+    with metadata_path.open(newline='') as file:
+        metadata = list(csv.DictReader(file))
+    if not metadata or any(not row.get(args.target) for row in metadata):
+        raise ValueError(f'Training metadata must contain nonempty {args.target} labels')
+    dataset = SimpleNamespace(mode='train', target=args.target, metadata=metadata)
+    indices = list(training_sampler(dataset, seed=args.seed))
+    labels = [row[args.target] for row in metadata]
+    original = Counter(labels)
+    sampled = Counter(labels[i] for i in indices)
+    unique = Counter(labels[i] for i in set(indices))
+    classes = sorted(original, key=lambda label: (-original[label], label))
+    rows = [dict(label=label, original=original[label], unique_sampled=unique[label],
+                 repeated_draws=sampled[label] - unique[label], sampled_total=sampled[label],
+                 not_sampled=original[label] - unique[label]) for label in classes]
+    output = args.output_dir or Path('results/distribution') / f'{args.target}_train_seed{args.seed}'
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / 'counts.csv').open('w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+    with (output / 'sampled_indices.csv').open('w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['draw', 'metadata_row_index', 'video_path', args.target, 'repeat_draw'])
+        seen = set()
+        for draw, index in enumerate(indices):
+            writer.writerow([draw, index, metadata[index]['video_path'], labels[index], index in seen])
+            seen.add(index)
+    (output / 'metadata.json').write_text(json.dumps(dict(
+        target=args.target, split='train', seed=args.seed, metadata_path=str(metadata_path.resolve()),
+        weighting='1 / sqrt(class_count)', replacement=True, epoch_samples=len(indices),
+        description='Reconstructed first sampler epoch, not a recorded training run. '
+                    'Unique = distinct metadata rows drawn; repeats = subsequent draws of those rows. '
+                    'Augmentation, when enabled, applies to every draw, including first draws.'
+    ), indent=2))
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
+    x = list(range(len(classes)))
+    blue, orange = '#4477AA', '#EE9944'
+    axes[0].bar(x, [original[c] for c in classes], color=blue, label='Original clips')
+    axes[1].bar(x, [unique[c] for c in classes], color=blue, label='Distinct clips sampled (first draw)')
+    axes[1].bar(x, [sampled[c] - unique[c] for c in classes],
+                bottom=[unique[c] for c in classes], color=orange, label='Repeated draws (fresh augmentation if enabled)')
+    axes[0].set_title(f'Original training set — {len(labels):,} clips')
+    axes[1].set_title(f'Oversampled epoch — {len(indices):,} draws, seed {args.seed}')
+    for ax, counts in zip(axes, (original, sampled)):
+        ax.set_xticks(x, [c.replace('_', ' ') for c in classes], rotation=55, ha='right')
+        ax.set_xlabel(args.target.capitalize())
+        ax.grid(axis='y', alpha=0.2)
+        ax.set_axisbelow(True)
+        ax.margins(y=0.25)
+        for i, label in enumerate(classes):
+            ax.annotate(str(counts[label]), (i, counts[label]), xytext=(0, 4),
+                        textcoords='offset points', ha='center', fontsize=8)
+        ax.legend(fontsize=8, loc='upper right')
+    axes[0].set_ylabel('Number of clips / draws')
+    fig.suptitle(f'{args.target.capitalize()} distribution: inverse-square-root oversampling')
+    fig.text(0.5, 0.02, 'Same epoch length; replacement can omit original clips. '
+             'Both first and repeated draws are augmented when augmentation is enabled.',
+             ha='center', fontsize=9)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    for extension in ('png', 'pdf'):
+        fig.savefig(output / f'{args.target}_distribution.{extension}', dpi=180)
+    plt.close(fig)
+    print(f'Saved distribution plot, counts and sampled indices to {output}')
+    return rows
+
+
 def pruning_ratio(value):
     value = float(value)
     if not 0 <= value < 1:
@@ -327,23 +509,36 @@ def pruning_ratio(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
+    distribution = commands.add_parser('distribution', help='Plot original and oversampled training class counts')
+    distribution.add_argument('--target', choices=['activity', 'species'], default='activity')
+    distribution.add_argument('--metadata-dir', type=Path, default=Path('data/mammalps_v1/benchmark_1/metadata'))
+    distribution.add_argument('--seed', type=int, default=42)
+    distribution.add_argument('--output-dir', type=Path)
     for command, description in (
         ('frames', 'Evaluate several frame counts with fixed weights'),
         ('pruning', 'Prune and fine-tune independent copies at four frames'),
         ('evaluate', 'Report accuracy and mAP for a saved model'),
         ('adaptive', 'Evaluate midpoint-first frame exits and save frames used'),
+        ('quantization', 'Compare baseline and pruned FP32 models against INT8 PTQ on CPU'),
     ):
         sub = commands.add_parser(command, help=description, description=description)
-        sub.add_argument('--checkpoint', type=Path, default=Path('checkpoints/activity_baseline.pt'))
-        sub.add_argument('--device', choices=['cpu', 'cuda'], default='cuda' if command == 'pruning' else 'cpu')
+        sub.add_argument('--target', choices=['activity', 'species'],
+                         help='Read from checkpoint by default; specify for legacy species checkpoints')
+        sub.add_argument('--checkpoint', type=Path)
+        sub.add_argument('--device', choices=['cpu'] if command == 'quantization' else ['cpu', 'cuda'], default='cuda' if command == 'pruning' else 'cpu')
         sub.add_argument('--split', choices=['val', 'test'], default='test' if command == 'evaluate' else 'val')
         sub.add_argument('--seed', type=int, default=42)
         sub.add_argument('--output-dir', type=Path,
                          default=Path('results/pruning_sweep_4frames') if command == 'pruning' else None)
+        if command == 'quantization':
+            sub.add_argument('--pruned-checkpoint', type=Path,
+                             help='Trusted full pruned model; default: <checkpoint stem>_pruned_full<suffix>')
+            sub.add_argument('--calibration-batches', type=positive_int, default=20)
+            sub.add_argument('--latency-runs', type=positive_int, default=50)
         if command == 'adaptive':
             sub.add_argument('--threshold', type=float, default=0.9)
         add_data_arguments(sub)
-        if command != 'pruning':
+        if command not in ('pruning', 'quantization'):
             sub.add_argument('--full-model', action='store_true', help='Load a trusted complete model, e.g. pruned *_full.pt')
         if command in ('frames', 'pruning'):
             sub.add_argument('--latency-runs', type=positive_int, default=50)
@@ -359,6 +554,12 @@ def parse_args(argv=None):
         else:
             sub.add_argument('--num-frames', type=positive_int, help='Default: saved frame count, otherwise 4')
     args = parser.parse_args(argv)
+    if args.command == 'distribution':
+        return args
+    if args.checkpoint is None:
+        args.checkpoint = Path(f"checkpoints/{args.target or 'activity'}_baseline.pt")
+    if args.command == 'quantization' and args.pruned_checkpoint is None:
+        args.pruned_checkpoint = args.checkpoint.with_name(f'{args.checkpoint.stem}_pruned_full{args.checkpoint.suffix}')
     if args.command == 'adaptive' and not 0 <= args.threshold <= 1:
         parser.error('--threshold must be between 0 and 1')
     if args.num_workers < 0:
@@ -370,6 +571,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.command == 'distribution':
+        plot_distribution(args)
+        return
     if getattr(args, 'plot_only', None):
         kind = 'frame' if args.command == 'frames' else 'pruning'
         plot_comparison(args.plot_only, args.output_dir or args.plot_only.parent, kind)
@@ -381,6 +585,8 @@ def main(argv=None):
         experiment.run_pruning()
     elif args.command == 'adaptive':
         experiment.run_adaptive()
+    elif args.command == 'quantization':
+        experiment.run_quantization()
     else:
         experiment.run_evaluation()
 

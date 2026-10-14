@@ -14,6 +14,7 @@ part of what this lab is teaching.
 from __future__ import annotations
 
 import copy
+from collections import Counter
 import io
 import math
 import time
@@ -25,6 +26,8 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 import torchvision
 import torchvision.transforms as T
+from torchvision.transforms import v2
+from torch.utils.data import WeightedRandomSampler
 
 from fvcore.nn import FlopCountAnalysis
 
@@ -33,6 +36,37 @@ from fvcore.nn import FlopCountAnalysis
 # --------------------------------------------------------------------------
 # Device / data
 # --------------------------------------------------------------------------
+
+def training_clip_transform():
+    """Mild augmentation of a uint8 [T,C,H,W] clip, sharing randomness over T.
+
+    This replaces the usual deterministic preprocessing for training only.
+    """
+    return v2.Compose([
+        v2.RandomResizedCrop(224, scale=(0.90, 1.0), ratio=(0.9, 1.1), antialias=True),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomApply([
+            v2.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02)
+        ], p=0.5),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def training_sampler(dataset, seed=42):
+    """Sample training clips with replacement, moderately boosting rare classes.
+
+    Use metadata only; each epoch still contains len(dataset) sampled clips.
+    """
+    if dataset.mode != "train":
+        raise ValueError("Oversampling is only allowed for the training split")
+    labels = [row[dataset.target] for row in dataset.metadata]
+    counts = Counter(labels)
+    return WeightedRandomSampler(
+        [1.0 / math.sqrt(counts[label]) for label in labels], num_samples=len(labels),
+        replacement=True, generator=torch.Generator().manual_seed(seed),
+    )
+
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,10 +197,14 @@ def evaluate_metrics(model, loader, device, class_to_idx):
         raise ValueError("Labels contain indices absent from the checkpoint mapping")
     predictions = probabilities.argmax(axis=1)
     support = np.bincount(labels, minlength=len(class_ids))
+    predicted_counts = np.bincount(predictions, minlength=len(class_ids))
+    correct_counts = np.bincount(labels[predictions == labels], minlength=len(class_ids))
     names = {index: name for name, index in class_to_idx.items()}
     ap = [float(average_precision_score(labels == index, probabilities[:, index]))
           if support[index] else None for index in class_ids]
-    per_class = [dict(class_id=index, activity=names[index], support=int(support[index]),
+    per_class = [dict(class_id=index, **{getattr(loader.dataset, "target", "activity"): names[index]}, support=int(support[index]),
+                      predicted_count=int(predicted_counts[index]),
+                      correct_count=int(correct_counts[index]),
                       average_precision=ap[index]) for index in class_ids]
     aggregate = dict(loss=total_loss / len(labels), num_videos=int(len(labels)), accuracy=float(accuracy_score(labels, predictions)),
                      map=float(np.mean([value for value in ap if value is not None])),

@@ -26,12 +26,18 @@ def nested_frame_positions(frames):
 
 class MammAlpsDataset(Dataset):
     def __init__(self, data_path_str, metadata_path_str, mode, num_frames=4,
-                 class_to_idx=None, transform=None, sampling="uniform"):
+                 class_to_idx=None, transform=None, sampling="uniform", clip_transform=None, target="activity"):
         if mode not in {"train", "val", "test"}:
             raise ValueError(f"Unknown mode: {mode}")
         if not isinstance(num_frames, int) or num_frames < 1:
             raise ValueError("num_frames must be a positive integer")
 
+        if clip_transform is not None and mode != "train":
+            raise ValueError("Clip augmentation is only allowed for the training split")
+        self.clip_transform = clip_transform
+        if target not in {"activity", "species"}:
+            raise ValueError("target must be activity or species")
+        self.target = target
         self.data_path = Path(data_path_str)
         self.mode = mode
         if sampling not in {"uniform", "nested"}:
@@ -46,9 +52,9 @@ class MammAlpsDataset(Dataset):
             reader = csv.DictReader(f)
             self.metadata = list(reader)
 
-        activity = sorted({row["activity"] for row in self.metadata})
+        labels = sorted({row[self.target] for row in self.metadata})
         if class_to_idx is None:
-            class_to_idx = {name: i for i, name in enumerate(activity)}
+            class_to_idx = {name: i for i, name in enumerate(labels)}
         self.class_to_idx = dict(class_to_idx)
 
 
@@ -58,7 +64,7 @@ class MammAlpsDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata[idx]
         clip = self.sample_clip(self.data_path / row["video_path"], self.num_frames)
-        return clip, torch.tensor(self.class_to_idx[row["activity"]], dtype=torch.long)
+        return clip, torch.tensor(self.class_to_idx[row[self.target]], dtype=torch.long)
 
     def sample_clip(self, clip, frames):
         """Sample nearest frames to equally spaced times, including both ends.
@@ -93,12 +99,14 @@ class MammAlpsDataset(Dataset):
                 for index, frame in enumerate(container.decode(video=0)):
                     if index in wanted:
                         rgb = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
-                        selected[index] = self.transform(rgb)
+                        # Keep raw frames for a single shared clip augmentation.
+                        selected[index] = rgb if self.clip_transform is not None else self.transform(rgb)
                     if index >= max(indices):
                         break
             if wanted != selected.keys():
                 raise ValueError("Could not decode all requested frames")
-            return torch.stack([selected[index] for index in indices])
+            clip_tensor = torch.stack([selected[index] for index in indices])
+            return self.clip_transform(clip_tensor) if self.clip_transform is not None else clip_tensor
         except Exception as exc:
             raise RuntimeError(f"Failed to sample video {clip}: {exc}") from exc
 
