@@ -1,0 +1,26 @@
+{
+  "format": "torchscript_int8_frame_backbone",
+  "target": "activity",
+  "class_to_idx": {
+    "camera_reaction": 0,
+    "chasing": 1,
+    "courtship": 2,
+    "escaping": 3,
+    "foraging": 4,
+    "grooming": 5,
+    "marking": 6,
+    "playing": 7,
+    "resting": 8,
+    "unknown": 9,
+    "vigilance": 10
+  },
+  "num_frames": 4,
+  "preprocessing": "MobileNet_V3_Large_Weights.IMAGENET1K_V2",
+  "aggregation": "mean_logits",
+  "quantization_backend": "x86",
+  "architecture": "mobilenet_v3_large",
+  "pruned": false,
+  "source_checkpoint": "/home/timon/Documents/CLS/CLS_Year2/EdgeAI/Big_Data_at_the_Edge_Project/Video/checkpoints/activity_augmented.pt",
+  "calibration_seed": 42,
+  "calibration_batches": 20
+}
