@@ -1,0 +1,27 @@
+{
+  "feature_config": {
+    "sample_rate": 16000,
+    "seconds": 2.0,
+    "n_fft": 512,
+    "hop_length": 160,
+    "n_mels": 40,
+    "n_mfcc": 20,
+    "center": false,
+    "features": "mfcc_mean_std"
+  },
+  "validation_recall_target": 0.95,
+  "manifest": "C:\\Users\\benja\\Documents\\CS_Master\\Big Data at the Edge\\Big_Data_at_the_Edge_Project\\data\\metadata\\benchmark_2_audio_model_manifest.csv",
+  "splits": {
+    "train": 556,
+    "test": 207,
+    "val": 145
+  },
+  "thresholds": {
+    "MFCC + LR": 0.15949788689613342,
+    "MFCC + RF": 0.37345345345345343
+  },
+  "seed": 42,
+  "benchmark_samples": 24,
+  "benchmark_repeats": 2,
+  "cost_caveat": "approx_frontend_gops is an analytical heuristic, NOT profiled FLOPs or energy"
+}
