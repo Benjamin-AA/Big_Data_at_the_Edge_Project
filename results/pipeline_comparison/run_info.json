@@ -1,0 +1,28 @@
+{
+  "dataset_split": "test",
+  "samples": 207,
+  "video_checkpoint": "Audio\\Video_checkpoints\\Pruned_10\\prune_0p1_full.pt",
+  "video_confidence_threshold": 0.9,
+  "battery_frame_caps": {
+    "1.0": 8,
+    "0.7": 4,
+    "0.4": 2,
+    "0.2": 1
+  },
+  "lr_probability_threshold": 0.15949788689613342,
+  "panns_thresholds": {
+    "block2": 0.2324143648147583,
+    "block4": 0.2000872790813446,
+    "final": 0.1661750376224517
+  },
+  "panns_margins": {
+    "block2": 2.0,
+    "block4": 0.25
+  },
+  "video_frame_gflops_est": 0.366136752,
+  "lr_frontend_gops_heuristic": 0.012734847,
+  "operation_method": "PANNs: THOP MAC\u00d72; Video: fvcore count\u00d72; MFCC: analytical proxy. Decoder and audio frontend not covered by profiler counts.",
+  "latency_method": "Timed FLAC read + audio inference and timed raw-video decode + video inference, with conditional video execution reusing matched video-only results. Download excluded.",
+  "activity_accuracy": "Not available for temporally unmatched Benchmark II activity labels",
+  "energy": "No power or battery life measured"
+}
