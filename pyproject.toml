@@ -8,4 +8,27 @@ dependencies = [
     "av>=16.0.0",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
+    "jupyterlab",
+    "ipykernel",
+    "ipywidgets",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "soundfile",
+    "scipy",
+    "librosa",
+    "imageio-ffmpeg",
+    "remotezip",
+    "scikit-learn",
+    "joblib",
+    "panns-inference",
+    "thop",
+    "torch-pruning",
+    "fvcore",
+]
+
+[project.optional-dependencies]
+yamnet = [
+    "tensorflow",
+    "tensorflow-hub",
 ]
