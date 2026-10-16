@@ -107,13 +107,20 @@ class Experiment:
     def profile(self, model, frames, device=None):
         import torch
         from fvcore.nn import FlopCountAnalysis
+        import warnings
         from utils import benchmark_latency
         device = self.checked_device(device if device is not None else self.device)
         model.to(device).eval()
         model.device = device
         shape = self.input_shape(frames)
-        with torch.no_grad():
+        with torch.no_grad(), warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=r"`torch\.jit\.script` is deprecated\. Please switch to .*",
+                category=FutureWarning,
+            )
             analysis = FlopCountAnalysis(model, torch.randn(*shape, device=device))
+            # Counts remain in run_info.json; avoid repeated console messages.
+            analysis.unsupported_ops_warnings(False)
             gflops = analysis.total() / 1e9
         latency = benchmark_latency(model, input_size=shape, device=device,
                                     n_runs=self.args.latency_runs)

@@ -1,6 +1,7 @@
 """Video datasets and a frame-averaged MobileNet classifier."""
 from bisect import bisect_left
 import csv
+import warnings
 from pathlib import Path
 import utils
 import av
@@ -25,6 +26,7 @@ def nested_frame_positions(frames):
 
 
 class MammAlpsDataset(Dataset):
+    """Load labeled clips with uniform or nested timestamp sampling."""
     def __init__(self, data_path_str, metadata_path_str, mode, num_frames=4,
                  class_to_idx=None, transform=None, sampling="uniform", clip_transform=None, target="activity"):
         if mode not in {"train", "val", "test"}:
@@ -112,6 +114,7 @@ class MammAlpsDataset(Dataset):
 
 
 class Classifier(nn.Module):
+    """Average MobileNet frame logits, optionally stopping confident videos early."""
     def __init__(self, device, input_size, weights, num_classes):
         super().__init__()
         self.input_size = input_size
@@ -188,19 +191,8 @@ class Classifier(nn.Module):
         counts = torch.full((batch,), max_frames, dtype=torch.long, device=clips.device)
         return (logits, counts) if return_frames_used else logits
 
-    @torch.no_grad()
-    def evaluate_model(self, inputs):
-        was_training = self.training
-        self.eval()
-        try:
-            return self(inputs)
-        finally:
-            self.train(was_training)
-
-    def prune_model(self, type=None):
-        # utils.apply_structured_pruning_torch()
-
-
+    def prune_model(self):
+        """Apply the baseline workflow's fixed 30% dependency-aware channel pruning."""
         example_inputs = torch.randn(1, 3, 224, 224, device=self.device)
 
         ignored_layers = [self.model.classifier[-1]]
@@ -224,10 +216,17 @@ class Classifier(nn.Module):
         self.to(cpu_device).eval()
         self.device = cpu_device
         example_inputs = (torch.randn(1, *self.input_size[-3:]),)
-        self.model = prepare_fx(
-            self.model, get_default_qconfig_mapping(backend), example_inputs,
-        )
-        # The wrapper flattens video batches into frames before the backbone.
-        utils.calibrate(self, calibrate_loader, cpu_device, n_batches=n_batches, seed=seed)
-        self.model = convert_fx(self.model)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Please use quant_min and quant_max to specify the range for observers\.\s+reduce_range will be deprecated in a future release of PyTorch\.",
+                category=UserWarning,
+                module=r"torch\.ao\.quantization\.observer",
+            )
+            self.model = prepare_fx(
+                self.model, get_default_qconfig_mapping(backend), example_inputs,
+            )
+            # The wrapper flattens video batches into frames before the backbone.
+            utils.calibrate(self, calibrate_loader, cpu_device, n_batches=n_batches, seed=seed)
+            self.model = convert_fx(self.model)
         return self

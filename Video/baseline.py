@@ -1,6 +1,5 @@
-"""Train and evaluate a video-level MammAlps activity or species baseline."""
+"""Train and evaluate a MammAlps baseline and a channel-pruned copy."""
 import argparse
-from copy import copy
 import random
 from pathlib import Path
 
@@ -46,6 +45,7 @@ def parse_args():
 
 
 def run_model(device, model, args, loaders, weights, mapping, input_size, save_full_model=False):
+    """Fit, reload the selected checkpoint, evaluate and profile one model."""
     print(f"Device: {device}; {args.target} classes: {mapping}; frames/video: {args.num_frames}")
 
     fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs,
@@ -105,11 +105,6 @@ def main():
                          generator=torch.Generator().manual_seed(args.seed))
         for mode, dataset in datasets.items()
     }
-    # Calibration uses the natural training distribution without random augmentation.
-    calibration_dataset = copy(datasets["train"])
-    calibration_dataset.clip_transform = None
-    calibration_loader = DataLoader(calibration_dataset, batch_size=args.batch_size,
-                                    num_workers=args.num_workers)
     mapping = datasets["train"].class_to_idx
     input_size = (1, args.num_frames, 3, 224, 224)
 
@@ -137,30 +132,7 @@ def main():
     pruned_args = argparse.Namespace(**vars(args))
     pruned_args.checkpoint = str(pruned_path)
     print("Pruned model run \n")
-    pruned_model = run_model(model=model_structured_depgraph, device=device, args=pruned_args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size, save_full_model=True)
-
-
-    # Compare all variants on the same CPU and full-video input shape.
-    cpu_device = torch.device("cpu")
-    print("CPU comparison (latency excludes decoding/preprocessing)")
-    for name, source in (("Baseline", baseline_model), ("Pruned", pruned_model)):
-        cpu_model = clone_model(source).cpu().eval()
-        cpu_model.device = cpu_device
-        _, fp32_acc = evaluate(cpu_model, loaders["val"], cpu_device)
-        fp32_size = model_size_mb(cpu_model)
-        fp32_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
-        print(f"{name} FP32: accuracy={fp32_acc:.2f}%, size={fp32_size:.2f} MB, "
-              f"latency={fp32_latency:.2f} ms/video")
-
-        cpu_model.quantize_weights(cpu_device, calibration_loader, n_batches=20, seed=args.seed)
-        _, int8_acc = evaluate(cpu_model, loaders["val"], cpu_device)
-        int8_size = model_size_mb(cpu_model)
-        int8_latency = benchmark_latency(cpu_model, input_size=input_size, device=cpu_device)
-        print(f"{name} INT8: accuracy={int8_acc:.2f}%, size={int8_size:.2f} MB, "
-              f"latency={int8_latency:.2f} ms/video; "
-              f"accuracy change={int8_acc - fp32_acc:+.2f} percentage points, "
-              f"speedup={fp32_latency / int8_latency:.2f}x")
-
+    run_model(model=model_structured_depgraph, device=device, args=pruned_args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size, save_full_model=True)
 
 
 if __name__ == "__main__":
