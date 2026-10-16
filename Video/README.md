@@ -20,4 +20,4 @@ checkpoint/output paths resolve as documented. Data defaults are repository-root
   using the stash's THOP ×2 convention.
 
 Recovery was selective; stash `11b831e` was not applied or dropped. No historical
-result files were rewritten. See [the recovery report](../RECOVERY_REPORT.md).
+result files were rewritten.

@@ -21,3 +21,10 @@ __pycache__/
 
 # Local video dataset, relocated under the shared data root
 /Data/mammalps_v1/
+
+# Generated video experiments and model artifacts (keep local)
+/Video/results/
+/Video/checkpoints/
+/Video/**/*.pt
+/Video/**/*.pth
+/Video/**/*.onnx
