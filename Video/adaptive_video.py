@@ -22,7 +22,7 @@ def select_policy_frames(battery):
 
 @torch.inference_mode()
 def adaptive_evaluate(model, loader, device, threshold=0.9,
-                      output_dir=Path('results/adaptive_video')):
+                      output_dir=Path('results/adaptive_video'), return_metrics=False):
     """Evaluate nested clips and save frame counts; return loss and accuracy (%).
 
     The dataset must use nested sampling and a sequential, non-dropping loader so
@@ -73,4 +73,6 @@ def adaptive_evaluate(model, loader, device, threshold=0.9,
     print(f"Accuracy: {100 * aggregate['accuracy']:.2f}%; mAP: {100 * aggregate['map']:.2f}%; "
           f"average frames: {aggregate['average_frames']:.2f}/{loader.dataset.num_frames}")
     print(f"Saved adaptive results to {output_dir}")
+    if return_metrics:
+        return aggregate
     return aggregate['loss'], 100 * aggregate['accuracy']

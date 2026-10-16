@@ -1,4 +1,4 @@
-"""Train and evaluate a MammAlps baseline and a channel-pruned copy."""
+"""Train and evaluate a MammAlps baseline, optionally pruning a copy."""
 import argparse
 import random
 from pathlib import Path
@@ -13,6 +13,9 @@ from utils import (get_device, fit, evaluate, count_parameters, model_size_mb,
                    training_clip_transform, training_sampler)
 
 
+DATA_ROOT = Path(__file__).resolve().parents[1] / "Data"
+
+
 def positive_int(value):
     number = int(value)
     if number < 1:
@@ -25,12 +28,16 @@ def parse_args():
     parser.add_argument("--num-frames", type=positive_int, default=4)
     parser.add_argument("--batch-size", type=positive_int, default=8, help="Videos per batch")
     parser.add_argument("--epochs", type=positive_int, default=3)
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for baseline training and pruning fine-tuning")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target", choices=["activity", "species"], default="activity")
     parser.add_argument("--checkpoint", help="Default: checkpoints/<target>_baseline.pt")
     parser.add_argument("--load-baseline", action="store_true",
-                        help="Load --checkpoint and skip baseline training before pruning")
+                        help="Load --checkpoint instead of baseline training; combine with --prune for fine-tuning")
+    parser.add_argument("--prune", action="store_true",
+                        help="Also prune and fine-tune a copy using the same augmentation/sampling settings")
     parser.add_argument("--augment", action="store_true",
                         help="Apply mild, temporally consistent training clip augmentation")
     parser.add_argument("--oversample", action="store_true",
@@ -38,6 +45,8 @@ def parse_args():
     args = parser.parse_args()
     if args.checkpoint is None:
         args.checkpoint = f"checkpoints/{args.target}_baseline.pt"
+    if not 0 < args.lr < float("inf"):
+        parser.error("lr must be positive and finite")
     if args.num_workers < 0:
         parser.error("num-workers must be nonnegative")
     return args
@@ -48,7 +57,7 @@ def run_model(device, model, args, loaders, weights, mapping, input_size, save_f
     """Fit, reload the selected checkpoint, evaluate and profile one model."""
     print(f"Device: {device}; {args.target} classes: {mapping}; frames/video: {args.num_frames}")
 
-    fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs,
+    fit(model, loaders["train"], loaders["val"], device, epochs=args.epochs, lr=args.lr,
         checkpoint_path=args.checkpoint,
         checkpoint_metadata={"target": args.target, "class_to_idx": mapping, "config": vars(args),
                              "sampling": "equidistant_timestamps_nearest_frame",
@@ -89,8 +98,8 @@ def main():
     datasets = {}
     for mode in ("train", "val", "test"):
         datasets[mode] = MammAlpsDataset(
-            "data/mammalps_v1/benchmark_1/clips/",
-            "data/mammalps_v1/benchmark_1/metadata/", mode, num_frames=args.num_frames,
+            DATA_ROOT / "mammalps_v1/benchmark_1/clips",
+            DATA_ROOT / "mammalps_v1/benchmark_1/metadata", mode, num_frames=args.num_frames,
             class_to_idx=None if mode == "train" else datasets["train"].class_to_idx,
             transform=weights.transforms(), target=args.target,
             clip_transform=training_clip_transform() if mode == "train" and args.augment else None,
@@ -123,6 +132,9 @@ def main():
         print("Baseline model run \n")
         baseline_model = run_model(model=model_mobilenet_v3, device=device, args=args, loaders=loaders, weights=weights, mapping=mapping, input_size=input_size)
     
+
+    if not args.prune:
+        return
 
     model_structured_depgraph = clone_model(baseline_model)
     model_structured_depgraph = model_structured_depgraph.to(device)

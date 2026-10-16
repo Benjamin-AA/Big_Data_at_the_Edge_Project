@@ -4,6 +4,46 @@ import csv
 import json
 from pathlib import Path
 
+DATA_ROOT = Path(__file__).resolve().parents[1] / "Data"
+
+
+SWEEP_FLOPS_METHOD = {
+    "profiler": "THOP", "multiplier": 2,
+    "convention": "2 * THOP MAC estimate (same convention as audio)",
+    "coverage": "Supported module operations only; functional/custom operations may be omitted. "
+                "Excludes decoding/preprocessing and adaptive routing/aggregation. "
+                "Estimated operations, not measured latency or energy.",
+}
+
+
+def count_sweep_flops(model, input_size, device):
+    """Estimated operations = 2 * THOP MACs, matching the audio notebooks.
+
+    Profile a copy so THOP hooks/buffers cannot modify the model being trained,
+    evaluated or saved. Use FP32 architecture for INT8-equivalent operation counts.
+    """
+    import torch
+    from thop import profile as thop_profile
+    from utils import clone_model
+
+    profiled_model = clone_model(model).to(device).eval()
+    dummy = torch.zeros(*input_size, device=device)
+    with torch.inference_mode():
+        macs, _ = thop_profile(profiled_model, inputs=(dummy,), verbose=False)
+    return 2.0 * float(macs)
+
+
+def pareto_indices(rows, metric='accuracy_pct'):
+    """Minimize compute and maximize quality; require one strict improvement.
+
+    Equal operating points are equivalent, not dominated, and remain in exports.
+    """
+    return [i for i, row in enumerate(rows) if not any(
+        other['average_gflops'] <= row['average_gflops']
+        and other[metric] >= row[metric]
+        and (other['average_gflops'] < row['average_gflops'] or other[metric] > row[metric])
+        for other in rows)]
+
 
 def positive_int(value):
     value = int(value)
@@ -15,8 +55,8 @@ def positive_int(value):
 def add_data_arguments(parser):
     parser.add_argument('--batch-size', type=positive_int, default=8)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--clips-dir', type=Path, default=Path('data/mammalps_v1/benchmark_1/clips'))
-    parser.add_argument('--metadata-dir', type=Path, default=Path('data/mammalps_v1/benchmark_1/metadata'))
+    parser.add_argument('--clips-dir', type=Path, default=DATA_ROOT / 'mammalps_v1/benchmark_1/clips')
+    parser.add_argument('--metadata-dir', type=Path, default=DATA_ROOT / 'mammalps_v1/benchmark_1/metadata')
 
 
 class Experiment:
@@ -179,6 +219,7 @@ class Experiment:
         from utils import fit, evaluate_metrics, load_checkpoint, count_parameters, model_size_mb
 
         experiment = self
+        frames = args.num_frames
         device = experiment.device
         bench_device = experiment.checked_device(args.benchmark_device)
         mapping, weights = experiment.mapping, experiment.weights
@@ -188,19 +229,19 @@ class Experiment:
                 "source_checkpoint": str(args.checkpoint.resolve()),
                 "source_mtime_ns": args.checkpoint.stat().st_mtime_ns, "unsupported_operators": {}}
         def loaders():
-            return {split: experiment.loader(split, 4) for split in {'train', 'val', args.split}}
+            return {split: experiment.loader(split, frames) for split in {'train', 'val', args.split}}
 
         rows = []
         csv_path = args.output_dir / "metrics.csv"
         def measure(model, label, pruning_ratio, selected_epoch):
             model.to(device).eval()
-            metrics, _ = evaluate_metrics(model, experiment.loader(args.split, 4), device, mapping)
+            metrics, _ = evaluate_metrics(model, experiment.loader(args.split, frames), device, mapping)
             loss, accuracy = metrics['loss'], 100 * metrics['accuracy']
             map_pct = 100 * metrics['map']
-            gflops, latency, unsupported = experiment.profile(model, 4, bench_device)
+            gflops, latency, unsupported = experiment.profile(model, frames, bench_device)
             info['unsupported_operators'][label] = unsupported
-            rows.append(dict(model=label, pruning_ratio=pruning_ratio, num_frames=4, split=args.split,
-                             num_videos=len(experiment.dataset(args.split, 4)), selected_epoch=selected_epoch,
+            rows.append(dict(model=label, pruning_ratio=pruning_ratio, num_frames=frames, split=args.split,
+                             num_videos=len(experiment.dataset(args.split, frames)), selected_epoch=selected_epoch,
                              accuracy_pct=accuracy, map_pct=map_pct, map_scope=metrics["map_scope"],
                              absent_classes=json.dumps(metrics["absent_classes"]), loss=loss, parameters=count_parameters(model),
                              size_mb=model_size_mb(model), fvcore_gflops=gflops,
@@ -215,6 +256,7 @@ class Experiment:
         for amount in sorted(set(args.ratios)):
             random.seed(args.seed); torch.manual_seed(args.seed)
             model = experiment.fresh_model()
+            model.input_size = experiment.input_shape(frames)
             label = f"prune_{str(amount).replace('.', 'p')}"
             if amount:
                 pruner = tp.pruner.MagnitudePruner(model.model,
@@ -227,7 +269,7 @@ class Experiment:
             random.seed(args.seed); torch.manual_seed(args.seed)
             data = loaders()
             path = args.output_dir / f'{label}.pt'
-            metadata = dict(target=self.target, class_to_idx=mapping, num_frames=4,
+            metadata = dict(target=self.target, class_to_idx=mapping, num_frames=frames,
                             pruning_ratio=amount, preprocessing=str(weights), aggregation='mean_logits')
             print(f"Fine-tuning {amount:.0%} channel removal for {args.epochs} epochs", flush=True)
             fit(model, data['train'], data['val'], device, epochs=args.epochs, lr=args.lr,
@@ -336,10 +378,126 @@ class Experiment:
 
     def run_adaptive(self):
         from adaptive_video import adaptive_evaluate
-        frames = self.args.num_frames or (self.trained_frames if self.trained_frames != 'unknown' else 4)
-        output = self.args.output_dir or Path('results/adaptive_video') / f'{self.checkpoint_path.stem}_{self.args.split}_{frames}frames_{self.args.device}'
-        adaptive_evaluate(self.fresh_model(), self.loader(self.args.split, frames), self.device,
-                          threshold=self.args.threshold, output_dir=output)
+        args = self.args
+        frames = args.num_frames or (self.trained_frames if self.trained_frames != 'unknown' else 4)
+        output = args.output_dir or Path('results/adaptive_video') / f'{self.checkpoint_path.stem}_{args.split}_{frames}frames_{args.device}'
+        model = self.fresh_model()
+        loader = self.loader(args.split, frames)
+        if args.sweep is None:
+            return adaptive_evaluate(model, loader, self.device,
+                                     threshold=args.threshold, output_dir=output)
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        thresholds = sorted(set(args.sweep or ([i / 10 for i in range(6)] + [i / 100 for i in range(55, 101, 5)])))
+        output = output / 'threshold_sweep'
+        output.mkdir(parents=True, exist_ok=True)
+        # Profile the frame backbone once. Adaptive inference only changes how many
+        # frames execute; confidence checks/aggregation and decoding are excluded.
+        frame_gflops = count_sweep_flops(model.model, (1, 3, 224, 224), self.device) / 1e9
+        details = dict(checkpoint=str(self.checkpoint_path.resolve()), target=self.target,
+                       split=args.split, device=str(self.device), max_frames=frames,
+                       thresholds=thresholds, seed=args.seed, per_frame_gflops=frame_gflops,
+                       profiling=dict(SWEEP_FLOPS_METHOD),
+                       compute_definition='2 * THOP MACs/frame times actual average frames. '
+                       + SWEEP_FLOPS_METHOD['coverage'])
+        (output / 'metadata.json').write_text(json.dumps(details, indent=2))
+        rows = []
+        # None disables confidence stopping: identical nested frames and weights,
+        # but every clip always executes the full frame budget.
+        for threshold in thresholds + [None]:
+            name = 'static_all_frames' if threshold is None else f'threshold_{threshold:g}'
+            print(f'{name}, maximum {frames} frames', flush=True)
+            metrics = adaptive_evaluate(model, loader, self.device, threshold=threshold,
+                                        output_dir=output / name, return_metrics=True)
+            rows.append(dict(operating_point=name, policy='static' if threshold is None else 'adaptive',
+                             threshold=threshold, accuracy_pct=100 * metrics['accuracy'],
+                             map_pct=100 * metrics['map'], map_scope=metrics['map_scope'],
+                             absent_classes=json.dumps(metrics['absent_classes']), loss=metrics['loss'],
+                             num_videos=metrics['num_videos'], max_frames=frames,
+                             average_frames=metrics['average_frames'],
+                             average_gflops=frame_gflops * metrics['average_frames'],
+                             full_budget_gflops=frame_gflops * frames,
+                             compute_saved_pct=100 * (1 - metrics['average_frames'] / frames)))
+            with (output / 'metrics.csv').open('w', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+                writer.writeheader(); writer.writerows(rows)
+        accuracy_front = set(pareto_indices(rows, 'accuracy_pct'))
+        map_front = set(pareto_indices(rows, 'map_pct'))
+        for i, row in enumerate(rows):
+            row['pareto_accuracy'] = i in accuracy_front
+            row['pareto_map'] = i in map_front
+        for filename, selected in (
+            ('metrics.csv', rows),
+            ('pareto_accuracy.csv', [row for i, row in enumerate(rows) if i in accuracy_front]),
+            ('pareto_map.csv', [row for i, row in enumerate(rows) if i in map_front]),
+        ):
+            with (output / filename).open('w', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+                writer.writeheader(); writer.writerows(selected)
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        static = rows[-1]
+        for ax, key, label, frontier in zip(axes, ('accuracy_pct', 'map_pct'),
+                                           ('Accuracy (%)', 'mAP (%)'), (accuracy_front, map_front)):
+            # Show available operating points faintly; only nondominated points
+            # form the frontier. Sorting at equal compute avoids vertical artifacts.
+            ax.scatter([r['average_gflops'] for r in rows], [r[key] for r in rows],
+                       color='lightgray', label='All measured operating points', zorder=1)
+            ordered = sorted([r for i, r in enumerate(rows) if i in frontier],
+                             key=lambda row: (row['average_gflops'], row[key]))
+            coordinates = sorted(set((r['average_gflops'], r[key]) for r in ordered))
+            ax.plot([x for x, _ in coordinates], [y for _, y in coordinates], 'o-',
+                    label='Pareto frontier', zorder=3)
+            for x, y in coordinates:
+                labels = ['static' if r['policy'] == 'static' else f"{r['threshold']:g}"
+                          for r in ordered if (r['average_gflops'], r[key]) == (x, y)]
+                ax.annotate(', '.join(labels), (x, y), xytext=(5, 6),
+                            textcoords='offset points', fontsize=8)
+            ax.scatter(static['average_gflops'], static[key], marker='*', s=160,
+                       color='tab:orange', label=f'Static {frames}-frame baseline', zorder=4)
+            ax.set(xlabel='Estimated average backbone GFLOPs/video (THOP ×2)', ylabel=label)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+        fig.suptitle(f'{self.checkpoint_path.name} | {args.split} | max {frames} frames')
+        fig.text(0.5, 0.02, 'Frontiers are specific to each metric and measured points. Lines connect discrete policies, not interpolated results.',
+                 ha='center', fontsize=8)
+        fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+        for extension in ('png', 'pdf'):
+            fig.savefig(output / f'adaptive_tradeoff.{extension}', dpi=180)
+        plt.close(fig)
+
+        interpretation = [f'Comparison on {args.split}, fixed checkpoint and maximum {frames} frames.',
+                          'Dominated means another measured policy uses no more compute and achieves '
+                          'at least equal quality, with one strict improvement.',
+                          'Static reference uses the same nested frames and model, with no confidence stopping.']
+        for key, label, frontier in (('accuracy_pct', 'Accuracy', accuracy_front), ('map_pct', 'mAP', map_front)):
+            interpretation.append(f"{label}: {len(frontier)} nondominated operating points; "
+                                  f"static reference {static[key]:.2f}% at {static['average_gflops']:.4f} GFLOPs/video.")
+            adaptive = [r for i, r in enumerate(rows) if i in frontier and r['policy'] == 'adaptive']
+            if adaptive:
+                cheapest = min(adaptive, key=lambda r: (r['average_gflops'], -r[key]))
+                interpretation.append(f"Lowest-compute adaptive frontier point: threshold {cheapest['threshold']:g}, "
+                                      f"{cheapest[key]:.2f}% ({cheapest[key]-static[key]:+.2f} pp vs static), "
+                                      f"{cheapest['compute_saved_pct']:.1f}% less backbone compute.")
+                preserving = [r for r in adaptive if r[key] >= static[key] and r['average_gflops'] < static['average_gflops']]
+                if preserving:
+                    best = min(preserving, key=lambda r: r['average_gflops'])
+                    interpretation.append(f"Threshold {best['threshold']:g} matches/exceeds static {label.lower()} "
+                                          f"with {best['compute_saved_pct']:.1f}% less backbone compute in this split.")
+                else:
+                    interpretation.append(f'No measured adaptive policy preserves static {label.lower()} while reducing compute.')
+            else:
+                interpretation.append('No adaptive policy lies on this frontier; the static reference dominates them.')
+            coords = {(rows[i]['average_gflops'], rows[i][key]) for i in frontier}
+            if len(coords) < 2:
+                interpretation.append('Only one distinct frontier point: no accuracy/quality versus compute trade-off is demonstrated for this metric.')
+        interpretation.extend([details['compute_definition'],
+                               'Use validation to choose a policy; a test-set frontier is descriptive, not independent policy selection.'])
+        (output / 'interpretation.txt').write_text('\n'.join(interpretation) + '\n')
+        print('\n'.join(interpretation))
+        print(f'Saved all points, filtered Pareto CSVs, interpretation and plots to {output}')
+        return rows
 
     def run_evaluation(self):
         args = self.args
@@ -418,7 +576,7 @@ def plot_comparison(csv_path, output_dir, kind):
         title = f"{first['checkpoint']} | {first['split']} | {first['device']} | fixed weights"
     else:
         axes[0, 0].legend()
-        title = f"Four frames | {first['split']} | latency on {first['benchmark_device']} | 0% = fine-tuning control"
+        title = f"{first['num_frames']} frames | {first['split']} | latency on {first['benchmark_device']} | 0% = fine-tuning control"
     fig.suptitle(title)
     fig.text(0.5, 0.01, 'Latency excludes decoding/preprocessing. FLOPs omit unsupported operators; 1 multiply-add = 1 FLOP.',
              ha='center', fontsize=9)
@@ -518,12 +676,12 @@ def parse_args(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     distribution = commands.add_parser('distribution', help='Plot original and oversampled training class counts')
     distribution.add_argument('--target', choices=['activity', 'species'], default='activity')
-    distribution.add_argument('--metadata-dir', type=Path, default=Path('data/mammalps_v1/benchmark_1/metadata'))
+    distribution.add_argument('--metadata-dir', type=Path, default=DATA_ROOT / 'mammalps_v1/benchmark_1/metadata')
     distribution.add_argument('--seed', type=int, default=42)
     distribution.add_argument('--output-dir', type=Path)
     for command, description in (
         ('frames', 'Evaluate several frame counts with fixed weights'),
-        ('pruning', 'Prune and fine-tune independent copies at four frames'),
+        ('pruning', 'Prune and fine-tune independent copies at a chosen frame count'),
         ('evaluate', 'Report accuracy and mAP for a saved model'),
         ('adaptive', 'Evaluate midpoint-first frame exits and save frames used'),
         ('quantization', 'Compare baseline and pruned FP32 models against INT8 PTQ on CPU'),
@@ -536,14 +694,17 @@ def parse_args(argv=None):
         sub.add_argument('--split', choices=['val', 'test'], default='test' if command == 'evaluate' else 'val')
         sub.add_argument('--seed', type=int, default=42)
         sub.add_argument('--output-dir', type=Path,
-                         default=Path('results/pruning_sweep_4frames') if command == 'pruning' else None)
+                         default=None)
         if command == 'quantization':
             sub.add_argument('--pruned-checkpoint', type=Path,
                              help='Trusted full pruned model; default: <checkpoint stem>_pruned_full<suffix>')
             sub.add_argument('--calibration-batches', type=positive_int, default=20)
             sub.add_argument('--latency-runs', type=positive_int, default=50)
         if command == 'adaptive':
-            sub.add_argument('--threshold', type=float, default=0.9)
+            adaptive_options = sub.add_mutually_exclusive_group()
+            adaptive_options.add_argument('--threshold', type=float, default=0.9)
+            adaptive_options.add_argument('--sweep', '--thresholds', nargs='*', type=float,
+                                          help='Sweep thresholds; default: 0.0–0.5 by 0.1, then 0.55–1.0 by 0.05')
         add_data_arguments(sub)
         if command not in ('pruning', 'quantization'):
             sub.add_argument('--full-model', action='store_true', help='Load a trusted complete model, e.g. pruned *_full.pt')
@@ -553,6 +714,8 @@ def parse_args(argv=None):
         if command == 'frames':
             sub.add_argument('--frames', nargs='+', type=positive_int, default=[1, 2, 4, 8, 16])
         elif command == 'pruning':
+            sub.add_argument('--num-frames', type=positive_int, default=4,
+                             help='Frames/video for fine-tuning, evaluation and profiling (default: 4)')
             sub.add_argument('--ratios', nargs='+', type=pruning_ratio, default=[0, 0.1, 0.3, 0.5, 0.7],
                              help='Channel removal fractions; 0 is an extra-fine-tuning control')
             sub.add_argument('--epochs', type=positive_int, default=3)
@@ -567,10 +730,14 @@ def parse_args(argv=None):
         args.checkpoint = Path(f"checkpoints/{args.target or 'activity'}_baseline.pt")
     if args.command == 'quantization' and args.pruned_checkpoint is None:
         args.pruned_checkpoint = args.checkpoint.with_name(f'{args.checkpoint.stem}_pruned_full{args.checkpoint.suffix}')
-    if args.command == 'adaptive' and not 0 <= args.threshold <= 1:
-        parser.error('--threshold must be between 0 and 1')
+    if args.command == 'adaptive':
+        thresholds = [args.threshold] if args.sweep is None else args.sweep
+        if any(not 0 <= value <= 1 for value in thresholds):
+            parser.error('confidence thresholds must be between 0 and 1')
     if args.num_workers < 0:
         parser.error('--num-workers must be nonnegative')
+    if args.command == 'pruning' and args.output_dir is None:
+        args.output_dir = Path(f'results/pruning_sweep_{args.num_frames}frames')
     if args.command == 'pruning' and not 0 < args.lr < float('inf'):
         parser.error('--lr must be positive and finite')
     return args
